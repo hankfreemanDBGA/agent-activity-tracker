@@ -1,24 +1,10 @@
 import streamlit as st
 import pandas as pd
-from snowflake.snowpark import Session
+from snowflake.snowpark.context import get_active_session
 import snowflake.snowpark.functions as F
 from snowflake.snowpark.window import Window
 
-# --- Snowflake Connection ---
-@st.cache_resource
-def get_session():
-    connection_params = {
-        "account": st.secrets["snowflake"]["account"],
-        "user": st.secrets["snowflake"]["user"],
-        "password": st.secrets["snowflake"]["password"],
-        "warehouse": st.secrets["snowflake"]["warehouse"],
-        "database": st.secrets["snowflake"]["database"],
-        "schema": st.secrets["snowflake"]["schema"],
-        "role": st.secrets["snowflake"]["role"]
-    }
-    return Session.builder.configs(connection_params).create()
-
-session = get_session()
+session = get_active_session()
 
 def get_call_stats(selected_date):
     """Calculates Total Calls and Billable Calls from the Call Stats table."""
@@ -26,6 +12,7 @@ def get_call_stats(selected_date):
     r = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_ORG_DATA.DIM_ACTIVE_AGENT_ROSTER_FLAT")
     o = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_BERMUDA.OLYMPUS")
     
+    # Join call stats with roster and olympus
     return c.join(r, c["USER_ID"] == r["ICD_ID"])\
             .join(o, c["CALL_UID"] == o["CALL_UID"], "left")\
             .filter(F.to_date(c["TIMESTAMP"]) == str(selected_date))\
@@ -56,6 +43,7 @@ def get_queue_behavior_data(selected_date):
     s_user_id = F.call_builtin("TRY_TO_NUMBER", s["USER_ID"])
     r_icd_id = F.call_builtin("TRY_TO_NUMBER", r["ICD_ID"])
 
+    # Explicitly selecting s["STATUS"] to distinguish from r["STATUS"]
     base_data = s.join(r, s_user_id == r_icd_id).filter(
         (s["USER_ID"].is_not_null()) & 
         (s["USER_ID"] != F.lit("0")) & 
@@ -74,6 +62,7 @@ def get_queue_behavior_data(selected_date):
     window_session = Window.partition_by("USER_ID").order_by("TIMESTAMP").rows_between(Window.UNBOUNDED_PRECEDING, Window.CURRENT_ROW)
     window_metrics = Window.partition_by("USER_ID", "QUEUE_SESSION_ID").order_by("TIMESTAMP").rows_between(Window.UNBOUNDED_PRECEDING, Window.UNBOUNDED_FOLLOWING)
     
+    # Create session and metrics
     df = base_data.with_column("QUEUE_SESSION_ID", F.sum(F.when(F.col("STATUS") == 1, 1).otherwise(0)).over(window_session))
     
     df = df.with_column("FIRST_CALL_WAIT_TIME", 
@@ -85,20 +74,24 @@ def get_queue_behavior_data(selected_date):
     return df.with_column("CALL_DURATION_MINUTES", F.col("SESSION_TOTAL_TIME") - F.col("FIRST_CALL_WAIT_TIME"))
 
 def get_sales_data(selected_date):
-    """Calculates Sales count per agent from GTL FTP data."""
-    gtl = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_SALE_DATA.GTL_FTP_POLICY_STAGE_DATA_REFINED_FACT_WITH_PRODUCT_TYPES")
-    cal = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_CALENDAR_DATA.DIM_CALENDAR_SF")
+    """Calculates Sales count and total premium per agent from Policies table."""
+    org = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_ORG_DATA.DIM_ACTIVE_AGENT_ROSTER_FLAT")
+    p = session.table("RAW.CRM_DSB.POLICIES")
     
-    gtl_with_date = gtl.with_column(
-        "APP_DATE",
-        F.to_date(F.call_builtin("CONVERT_TIMEZONE", F.lit("UTC"), F.lit("America/Chicago"), 
-                                  F.col("NEW_APP_RECEIVED_DATE").cast("TIMESTAMP_NTZ")))
-    )
-    
-    return gtl_with_date.join(cal, F.col("APP_DATE") == F.to_date(cal["CALENDAR_DATE"]))\
-            .filter(F.to_date(cal["CALENDAR_DATE"]) == str(selected_date))\
-            .group_by(gtl["AGENT_NAME"], gtl["DEPARTMENT"], gtl["MANAGER"])\
-            .agg(F.count("*").alias("SALES"))
+    return org.join(p, p["USER_ID"] == org["CRM_ID"], "left")\
+            .filter(
+                (F.to_date(p["SALE_MADE_DATE"]) == str(selected_date)) &
+                (p["ANNUAL_PREMIUM"].is_not_null())
+            )\
+            .group_by(
+                org["NAME"].alias("NAME"),
+                org["DEPARTMENT"].alias("DEPARTMENT"),
+                org["MANAGER"].alias("MANAGER")
+            )\
+            .agg(
+                F.count("*").alias("SALES"),
+                F.sum(p["ANNUAL_PREMIUM"]).alias("TOTAL_PREMIUM")
+            )
 
 # --- UI Setup ---
 st.set_page_config(layout="wide")
@@ -109,25 +102,28 @@ selected_date = st.date_input("Select Date", value=None)
 if selected_date:
     try:
         with st.spinner("Processing data from Snowflake..."):
+            # 1. Pull data into DataFrames
             df_calls_pd = get_call_stats(selected_date).to_pandas()
             df_queue_pd = get_queue_behavior_data(selected_date).to_pandas()
             df_sales_pd = get_sales_data(selected_date).to_pandas()
-            
-            df_sales_pd = df_sales_pd.rename(columns={"AGENT_NAME": "NAME"})
 
+            # 2. Aggregate Queue Stats at Agent Level
             if not df_queue_pd.empty:
+                # Only use session-end rows (STATUS is null) to avoid duplicate summing
                 session_end_rows = df_queue_pd[df_queue_pd["STATUS"].isna()]
                 queue_summary = session_end_rows.groupby(["NAME", "DEPARTMENT", "MANAGER"]).agg({
                     "CALL_DURATION_MINUTES": "sum",
                     "SESSION_TOTAL_TIME": "sum"
                 }).reset_index()
                 
+                # Convert minutes to hours
                 queue_summary["CALL_DURATION_HOURS"] = (queue_summary["CALL_DURATION_MINUTES"] / 60).round(2)
                 queue_summary["SESSION_TOTAL_HOURS"] = (queue_summary["SESSION_TOTAL_TIME"] / 60).round(2)
                 queue_summary = queue_summary.drop(columns=["CALL_DURATION_MINUTES", "SESSION_TOTAL_TIME"])
             else:
                 queue_summary = pd.DataFrame(columns=["NAME", "DEPARTMENT", "MANAGER", "CALL_DURATION_HOURS", "SESSION_TOTAL_HOURS"])
                 
+            # 3. Master Merge (Outer join to ensure we keep everyone)
             master_df = df_calls_pd.merge(queue_summary, on=["NAME", "DEPARTMENT", "MANAGER"], how="outer")
             master_df = master_df.merge(df_sales_pd, on=["NAME", "DEPARTMENT", "MANAGER"], how="outer").fillna(0)
 
@@ -139,6 +135,7 @@ if selected_date:
                 selected_dept = st.selectbox("Department", departments)
             
             with col2:
+                # Filter managers based on selected department
                 if selected_dept == "All":
                     available_managers = master_df["MANAGER"].unique().tolist()
                 else:
@@ -146,6 +143,7 @@ if selected_date:
                 managers = ["All"] + sorted(available_managers)
                 selected_manager = st.selectbox("Manager", managers)
 
+            # Apply filters
             filtered_df = master_df.copy()
             if selected_dept != "All":
                 filtered_df = filtered_df[filtered_df["DEPARTMENT"] == selected_dept]
@@ -154,7 +152,7 @@ if selected_date:
 
             # --- Display ---
             st.subheader(f"Agent Activity for {selected_date}")
-            cols = ["NAME", "DEPARTMENT", "MANAGER", "TOTAL_CALLS", "BILLABLE_CALLS", "SALES", "CALL_DURATION_HOURS", "SESSION_TOTAL_HOURS"]
+            cols = ["NAME", "DEPARTMENT", "MANAGER", "TOTAL_CALLS", "BILLABLE_CALLS", "SALES", "TOTAL_PREMIUM", "CALL_DURATION_HOURS", "SESSION_TOTAL_HOURS"]
             st.dataframe(filtered_df[cols].sort_values("TOTAL_CALLS", ascending=False), use_container_width=True, hide_index=True)
 
     except Exception as e:
