@@ -13,7 +13,8 @@ def get_session():
         "password": st.secrets["snowflake"]["password"],
         "warehouse": st.secrets["snowflake"]["warehouse"],
         "database": st.secrets["snowflake"]["database"],
-        "schema": st.secrets["snowflake"]["schema"]
+        "schema": st.secrets["snowflake"]["schema"],
+        "role": st.secrets["snowflake"]["role"]
     }
     return Session.builder.configs(connection_params).create()
 
@@ -86,7 +87,7 @@ def get_queue_behavior_data(selected_date):
 def get_sales_data(selected_date):
     """Calculates Sales count per agent from GTL FTP data."""
     gtl = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_SALE_DATA.GTL_FTP_POLICY_STAGE_DATA_REFINED_FACT_WITH_PRODUCT_TYPES")
-    cal = session.table("DBGA_TEST_CALENDAR_DATA.DIM_CALENDAR_SF")
+    cal = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_CALENDAR_DATA.DIM_CALENDAR_SF")
     
     gtl_with_date = gtl.with_column(
         "APP_DATE",
