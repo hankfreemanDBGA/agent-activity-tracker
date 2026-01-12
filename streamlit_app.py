@@ -1,151 +1,162 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+from snowflake.snowpark import Session
+import snowflake.snowpark.functions as F
+from snowflake.snowpark.window import Window
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# --- Snowflake Connection ---
+@st.cache_resource
+def get_session():
+    connection_params = {
+        "account": st.secrets["snowflake"]["account"],
+        "user": st.secrets["snowflake"]["user"],
+        "password": st.secrets["snowflake"]["password"],
+        "warehouse": st.secrets["snowflake"]["warehouse"],
+        "database": st.secrets["snowflake"]["database"],
+        "schema": st.secrets["snowflake"]["schema"]
+    }
+    return Session.builder.configs(connection_params).create()
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+session = get_session()
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+def get_call_stats(selected_date):
+    """Calculates Total Calls and Billable Calls from the Call Stats table."""
+    c = session.table("RAW.DIC.CALL_STATS")
+    r = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_ORG_DATA.DIM_ACTIVE_AGENT_ROSTER_FLAT")
+    o = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_BERMUDA.OLYMPUS")
+    
+    return c.join(r, c["USER_ID"] == r["ICD_ID"])\
+            .join(o, c["CALL_UID"] == o["CALL_UID"], "left")\
+            .filter(F.to_date(c["TIMESTAMP"]) == str(selected_date))\
+            .select(
+                r["NAME"].alias("NAME"), 
+                r["DEPARTMENT"].alias("DEPARTMENT"), 
+                r["MANAGER"].alias("MANAGER"), 
+                c["CALL_UID"].alias("CALL_UID"),
+                o["ANSWERED_FLAG"],
+                o["BILLABLE_FLAG"]
+            )\
+            .group_by("NAME", "DEPARTMENT", "MANAGER")\
+            .agg(
+                F.count("CALL_UID").alias("TOTAL_CALLS"),
+                F.sum(
+                    F.when(
+                        (F.col("ANSWERED_FLAG") == "Y") & (F.col("BILLABLE_FLAG") == "Y"), 
+                        1
+                    ).otherwise(0)
+                ).alias("BILLABLE_CALLS")
+            )
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+def get_queue_behavior_data(selected_date):
+    """Calculates Time/Session Metrics from Status Stats table."""
+    s = session.table("RAW.DIC.CALL_IN_USER_STATUS_STATS")
+    r = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_ORG_DATA.DIM_ACTIVE_AGENT_ROSTER_FLAT")
+    
+    s_user_id = F.call_builtin("TRY_TO_NUMBER", s["USER_ID"])
+    r_icd_id = F.call_builtin("TRY_TO_NUMBER", r["ICD_ID"])
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+    base_data = s.join(r, s_user_id == r_icd_id).filter(
+        (s["USER_ID"].is_not_null()) & 
+        (s["USER_ID"] != F.lit("0")) & 
+        (F.to_date(s["TIMESTAMP"]) == str(selected_date))
+    ).select(
+        s["USER_ID"], 
+        s["STATUS"].alias("STATUS"),
+        s["WAIT_TIME"], 
+        s["TIME_SPENT_IN_QUEUE"], 
+        s["TIMESTAMP"],
+        r["NAME"], 
+        r["DEPARTMENT"], 
+        r["MANAGER"]
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    window_session = Window.partition_by("USER_ID").order_by("TIMESTAMP").rows_between(Window.UNBOUNDED_PRECEDING, Window.CURRENT_ROW)
+    window_metrics = Window.partition_by("USER_ID", "QUEUE_SESSION_ID").order_by("TIMESTAMP").rows_between(Window.UNBOUNDED_PRECEDING, Window.UNBOUNDED_FOLLOWING)
+    
+    df = base_data.with_column("QUEUE_SESSION_ID", F.sum(F.when(F.col("STATUS") == 1, 1).otherwise(0)).over(window_session))
+    
+    df = df.with_column("FIRST_CALL_WAIT_TIME", 
+                        F.first_value(F.when(F.col("STATUS") == 3, F.col("WAIT_TIME")).otherwise(None), ignore_nulls=True).over(window_metrics))
+    
+    df = df.with_column("SESSION_TOTAL_TIME", 
+                        F.first_value(F.when(F.col("STATUS").is_null(), F.col("TIME_SPENT_IN_QUEUE")).otherwise(None), ignore_nulls=True).over(window_metrics))
+    
+    return df.with_column("CALL_DURATION_MINUTES", F.col("SESSION_TOTAL_TIME") - F.col("FIRST_CALL_WAIT_TIME"))
 
-    return gdp_df
+def get_sales_data(selected_date):
+    """Calculates Sales count per agent from GTL FTP data."""
+    gtl = session.table("DBGA_TEST_ANALYTICS.DBGA_TEST_SALE_DATA.GTL_FTP_POLICY_STAGE_DATA_REFINED_FACT_WITH_PRODUCT_TYPES")
+    cal = session.table("DBGA_TEST_CALENDAR_DATA.DIM_CALENDAR_SF")
+    
+    gtl_with_date = gtl.with_column(
+        "APP_DATE",
+        F.to_date(F.call_builtin("CONVERT_TIMEZONE", F.lit("UTC"), F.lit("America/Chicago"), 
+                                  F.col("NEW_APP_RECEIVED_DATE").cast("TIMESTAMP_NTZ")))
+    )
+    
+    return gtl_with_date.join(cal, F.col("APP_DATE") == F.to_date(cal["CALENDAR_DATE"]))\
+            .filter(F.to_date(cal["CALENDAR_DATE"]) == str(selected_date))\
+            .group_by(gtl["AGENT_NAME"], gtl["DEPARTMENT"], gtl["MANAGER"])\
+            .agg(F.count("*").alias("SALES"))
 
-gdp_df = get_gdp_data()
+# --- UI Setup ---
+st.set_page_config(layout="wide")
+st.title("📊 Agent Performance Dashboard")
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+selected_date = st.date_input("Select Date", value=None)
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+if selected_date:
+    try:
+        with st.spinner("Processing data from Snowflake..."):
+            df_calls_pd = get_call_stats(selected_date).to_pandas()
+            df_queue_pd = get_queue_behavior_data(selected_date).to_pandas()
+            df_sales_pd = get_sales_data(selected_date).to_pandas()
+            
+            df_sales_pd = df_sales_pd.rename(columns={"AGENT_NAME": "NAME"})
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+            if not df_queue_pd.empty:
+                session_end_rows = df_queue_pd[df_queue_pd["STATUS"].isna()]
+                queue_summary = session_end_rows.groupby(["NAME", "DEPARTMENT", "MANAGER"]).agg({
+                    "CALL_DURATION_MINUTES": "sum",
+                    "SESSION_TOTAL_TIME": "sum"
+                }).reset_index()
+                
+                queue_summary["CALL_DURATION_HOURS"] = (queue_summary["CALL_DURATION_MINUTES"] / 60).round(2)
+                queue_summary["SESSION_TOTAL_HOURS"] = (queue_summary["SESSION_TOTAL_TIME"] / 60).round(2)
+                queue_summary = queue_summary.drop(columns=["CALL_DURATION_MINUTES", "SESSION_TOTAL_TIME"])
+            else:
+                queue_summary = pd.DataFrame(columns=["NAME", "DEPARTMENT", "MANAGER", "CALL_DURATION_HOURS", "SESSION_TOTAL_HOURS"])
+                
+            master_df = df_calls_pd.merge(queue_summary, on=["NAME", "DEPARTMENT", "MANAGER"], how="outer")
+            master_df = master_df.merge(df_sales_pd, on=["NAME", "DEPARTMENT", "MANAGER"], how="outer").fillna(0)
 
-# Add some spacing
-''
-''
+            # --- Filters ---
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                departments = ["All"] + sorted(master_df["DEPARTMENT"].unique().tolist())
+                selected_dept = st.selectbox("Department", departments)
+            
+            with col2:
+                if selected_dept == "All":
+                    available_managers = master_df["MANAGER"].unique().tolist()
+                else:
+                    available_managers = master_df[master_df["DEPARTMENT"] == selected_dept]["MANAGER"].unique().tolist()
+                managers = ["All"] + sorted(available_managers)
+                selected_manager = st.selectbox("Manager", managers)
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+            filtered_df = master_df.copy()
+            if selected_dept != "All":
+                filtered_df = filtered_df[filtered_df["DEPARTMENT"] == selected_dept]
+            if selected_manager != "All":
+                filtered_df = filtered_df[filtered_df["MANAGER"] == selected_manager]
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+            # --- Display ---
+            st.subheader(f"Agent Activity for {selected_date}")
+            cols = ["NAME", "DEPARTMENT", "MANAGER", "TOTAL_CALLS", "BILLABLE_CALLS", "SALES", "CALL_DURATION_HOURS", "SESSION_TOTAL_HOURS"]
+            st.dataframe(filtered_df[cols].sort_values("TOTAL_CALLS", ascending=False), use_container_width=True, hide_index=True)
 
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    except Exception as e:
+        st.error(f"Error: {e}")
+else:
+    st.info("Please select a date to generate the analytics.")
