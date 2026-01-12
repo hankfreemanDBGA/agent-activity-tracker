@@ -1,10 +1,25 @@
 import streamlit as st
 import pandas as pd
-from snowflake.snowpark.context import get_active_session
+from snowflake.snowpark import Session
 import snowflake.snowpark.functions as F
 from snowflake.snowpark.window import Window
 
-session = get_active_session()
+# --- Snowflake Connection ---
+def get_session():
+    if "snowpark_session" not in st.session_state:
+        connection_params = {
+            "account": st.secrets["snowflake"]["account"],
+            "user": st.secrets["snowflake"]["user"],
+            "password": st.secrets["snowflake"]["password"],
+            "warehouse": st.secrets["snowflake"]["warehouse"],
+            "database": st.secrets["snowflake"]["database"],
+            "schema": st.secrets["snowflake"]["schema"],
+            "role": st.secrets["snowflake"]["role"]
+        }
+        st.session_state.snowpark_session = Session.builder.configs(connection_params).create()
+    return st.session_state.snowpark_session
+
+session = get_session()
 
 def get_call_stats(selected_date):
     """Calculates Total Calls and Billable Calls from the Call Stats table."""
